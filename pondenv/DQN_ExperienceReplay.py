@@ -4,10 +4,12 @@ import torch.nn as nn
 import torch.optim as optim
 import random
 import numpy as np
-from model_utils import save_model, update_best_models
+from collections import deque
 from PondEnv import PondEnv
+from model_utils import save_model, update_best_models
 
 
+# Define the Q-Network
 class QNetwork(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(QNetwork, self).__init__()
@@ -21,11 +23,32 @@ class QNetwork(nn.Module):
         return self.fc3(x)
 
 
+# Experience Replay Buffer
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+
+    def store(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        return (
+            torch.tensor(np.array(states), dtype=torch.float32),
+            torch.tensor(actions, dtype=torch.long),
+            torch.tensor(rewards, dtype=torch.float32),
+            torch.tensor(np.array(next_states), dtype=torch.float32),
+            torch.tensor(dones, dtype=torch.float32),
+        )
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+# Masked action selection
 def select_action(q_values, action_mask, epsilon):
-    if not isinstance(action_mask, torch.Tensor):
-        action_mask = torch.tensor(action_mask, dtype=torch.bool)
-    else:
-        action_mask = action_mask.bool()
+    action_mask = torch.tensor(action_mask, dtype=torch.bool) if not isinstance(action_mask, torch.Tensor) else action_mask.bool()
 
     if random.random() < epsilon:
         valid_indices = torch.nonzero(action_mask, as_tuple=True)[0]
@@ -41,7 +64,8 @@ def select_action(q_values, action_mask, epsilon):
     return action
 
 
-def evaluate(env, q_network, num_eval_episodes=20):
+# Evaluation function
+def evaluate(env, q_network, num_eval_episodes=200):
     results = {'win': 0, 'lose': 0, 'tie': 0}
     for _ in range(num_eval_episodes):
         env.reset()
@@ -74,10 +98,24 @@ def evaluate(env, q_network, num_eval_episodes=20):
     winrate = results['win'] / total * 100
     lose_rate = results['lose'] / total * 100
     tie_rate = results['tie'] / total * 100
+
     return winrate, lose_rate, tie_rate
 
 
-def train_dqn_with_target(env, num_episodes=1000, gamma=0.99, alpha=0.001, epsilon=1, epsilon_min=0.1, epsilon_decay=0.995, target_update_freq=100, eval_interval=10):
+# DQN Training Loop with Experience Replay and Target Network
+def train_dqn_with_replay_and_target(
+    env,
+    num_episodes=1000,
+    gamma=0.99,
+    alpha=0.001,
+    epsilon=1.0,
+    epsilon_min=0.1,
+    epsilon_decay=0.995,
+    batch_size=64,
+    buffer_capacity=10000,
+    target_update_freq=100,
+    eval_interval=10,
+):
     state_dim = len(env.reset())
     action_dim = env.num_actions()
     q_network = QNetwork(state_dim, action_dim)
@@ -88,7 +126,7 @@ def train_dqn_with_target(env, num_episodes=1000, gamma=0.99, alpha=0.001, epsil
     optimizer = optim.Adam(q_network.parameters(), lr=alpha)
     loss_fn = nn.MSELoss()
 
-    epsilon = epsilon
+    buffer = ReplayBuffer(buffer_capacity)
     best_models = []
 
     for episode in range(num_episodes):
@@ -110,26 +148,28 @@ def train_dqn_with_target(env, num_episodes=1000, gamma=0.99, alpha=0.001, epsil
             next_state, reward, done = env.step_with_encoded_action(action_vector)
             next_state = torch.tensor(next_state, dtype=torch.float32)
 
-            with torch.no_grad():
-                target_q = reward
-                if not done:
-                    env.generate_actions_for_current_player()
+            buffer.store(state.numpy(), action_idx, reward, next_state.numpy(), done)
+            state = next_state
+
+            if len(buffer) >= batch_size:
+                states, actions, rewards, next_states, dones = buffer.sample(batch_size)
+
+                with torch.no_grad():
                     next_action_mask = env.action_mask
                     if np.any(next_action_mask):
-                        next_action_mask = torch.tensor(next_action_mask, dtype=torch.bool)
-                        next_q_values = target_network(next_state)
-                        max_next_q_value = torch.max(next_q_values[next_action_mask]).item()
+                        next_q_values = target_network(next_states)
+                        max_next_q_values = torch.max(next_q_values, dim=1)[0]
                     else:
-                        max_next_q_value = 0
-                    target_q += gamma * max_next_q_value
+                        max_next_q_values = torch.zeros_like(rewards)
+                    targets = rewards + gamma * max_next_q_values * (1 - dones)
 
-            predicted_q_value = q_network(state)[action_idx]
-            loss = loss_fn(predicted_q_value, torch.tensor(target_q, dtype=torch.float32))
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                q_values = q_network(states)
+                predicted_q_values = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
 
-            state = next_state
+                loss = loss_fn(predicted_q_values, targets)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
         if episode % target_update_freq == 0:
             target_network.load_state_dict(q_network.state_dict())
@@ -140,15 +180,16 @@ def train_dqn_with_target(env, num_episodes=1000, gamma=0.99, alpha=0.001, epsil
             winrate, lose_rate, tie_rate = evaluate(env, q_network, num_eval_episodes=200)
             print(f"Episode {episode} | Win Rate: {winrate:.2f}% | Lose Rate: {lose_rate:.2f}% | Tie Rate: {tie_rate:.2f}%")
 
-            model_path = save_model(q_network, winrate, folder="models/DQN_with_Target")
+            model_path = save_model(q_network, winrate, folder="models/DQN_with_Replay")
             best_models = update_best_models(winrate, model_path, best_models, top_k=5)
 
     print("\n--- Top 5 des modèles ---")
     for winrate, path in best_models:
         print(f"Modèle : {path} | Winrate : {winrate:.2f}%")
+
     return q_network
 
 
 if __name__ == "__main__":
     env = PondEnv()
-    train_dqn_with_target(env, num_episodes=10000, eval_interval=100)
+    trained_q_network = train_dqn_with_replay_and_target(env, num_episodes=10000, eval_interval=100)

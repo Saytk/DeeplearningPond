@@ -5,7 +5,7 @@ import torch.optim as optim
 import random
 import numpy as np
 from PondEnv import PondEnv
-
+from model_utils import save_model, load_model, update_best_models
 
 # Define the Q-Network
 class QNetwork(nn.Module):
@@ -47,7 +47,7 @@ def evaluate(env, q_network, num_eval_episodes=20):
     results = {'win': 0, 'lose': 0, 'tie': 0}
 
     for _ in range(num_eval_episodes):
-        env = PondEnv()
+        env.reset()
         state = torch.tensor(env.encode_state(), dtype=torch.float32)
         done = False
 
@@ -81,8 +81,8 @@ def evaluate(env, q_network, num_eval_episodes=20):
     return winrate, lose_rate, tie_rate
 
 
-# DQN Training Loop with Encoded Action and Top 5 Models
-def train_dqn(env, num_episodes=1000, gamma=0.99, alpha=0.001, epsilon=1, epsilon_min=0.1, epsilon_decay=0.995, eval_interval=10):
+# DQN Training Loop
+def train_dqn(env, num_episodes=1000, gamma=0.99, alpha=0.001, epsilon=1.0, epsilon_min=0.1, epsilon_decay=0.995, eval_interval=10):
     state_dim = len(env.reset())
     action_dim = env.num_actions()
     q_network = QNetwork(state_dim, action_dim)
@@ -90,17 +90,17 @@ def train_dqn(env, num_episodes=1000, gamma=0.99, alpha=0.001, epsilon=1, epsilo
     loss_fn = nn.MSELoss()
 
     epsilon = epsilon
-    best_models = []  # Liste des 5 meilleurs modèles [(winrate, model_path)]
+    best_models = []  # List of top models [(winrate, model_path)]
 
     for episode in range(num_episodes):
-        env = PondEnv()
+        env.reset()
         state = torch.tensor(env.encode_state(), dtype=torch.float32)
         total_reward = 0
         step_count = 0
         done = False
 
         while not done:
-            list_of_actions = env.generate_actions_for_current_player()
+            env.generate_actions_for_current_player()
             action_mask = env.action_mask
             if not np.any(action_mask):
                 break
@@ -118,8 +118,15 @@ def train_dqn(env, num_episodes=1000, gamma=0.99, alpha=0.001, epsilon=1, epsilo
             with torch.no_grad():
                 target_q = reward
                 if not done:
-                    next_q_values = q_network(next_state)
-                    target_q += gamma * torch.max(next_q_values[torch.tensor(action_mask, dtype=torch.bool)]).item()
+                    env.generate_actions_for_current_player()
+                    next_action_mask = env.action_mask
+                    if np.any(next_action_mask):
+                        next_action_mask = torch.tensor(next_action_mask, dtype=torch.bool)
+                        next_q_values = q_network(next_state)
+                        max_next_q_value = torch.max(next_q_values[next_action_mask]).item()
+                    else:
+                        max_next_q_value = 0
+                    target_q += gamma * max_next_q_value
 
             q_values = q_network(state)
             predicted_q_value = q_values[action_idx]
@@ -134,25 +141,12 @@ def train_dqn(env, num_episodes=1000, gamma=0.99, alpha=0.001, epsilon=1, epsilo
 
         epsilon = max(epsilon_min, epsilon * epsilon_decay)
 
-        # Évaluation périodique
         if episode % eval_interval == 0:
-            winrate, lose_rate, tie_rate = evaluate(env, q_network, num_eval_episodes=1000)
+            winrate, lose_rate, tie_rate = evaluate(env, q_network, num_eval_episodes=20)
             print(f"Episode {episode} | Win Rate: {winrate:.2f}% | Lose Rate: {lose_rate:.2f}% | Tie Rate: {tie_rate:.2f}%")
 
-            model_path = f"q_network_{winrate:.2f}.pth"
-            if len(best_models) < 5 or winrate > min(best_models, key=lambda x: x[0])[0]:
-                # Sauvegarder le modèle
-                torch.save(q_network.state_dict(), model_path)
-                print(f"Modèle enregistré : {model_path}")
-
-                # Ajouter au top 5
-                best_models.append((winrate, model_path))
-                best_models = sorted(best_models, key=lambda x: x[0], reverse=True)[:5]
-
-                # Supprimer les anciens fichiers
-                for _, path in best_models[5:]:
-                    if os.path.exists(path):
-                        os.remove(path)
+            model_path = save_model(q_network, winrate, folder="saved_models/DQN")
+            best_models = update_best_models(winrate, model_path, best_models, top_k=5)
 
     print("\n--- Top 5 des modèles ---")
     for winrate, path in best_models:
@@ -167,11 +161,10 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Train the network
-    trained_q_network = train_dqn(env, num_episodes=10000, eval_interval=10)
+    trained_q_network = train_dqn(env, num_episodes=1000, eval_interval=10)
 
     # Final evaluation
-    env = PondEnv()
-    winrate, lose_rate, tie_rate = evaluate(env, trained_q_network, num_eval_episodes=1000)
+    winrate, lose_rate, tie_rate = evaluate(env, trained_q_network, num_eval_episodes=20)
     print("\n--- Final Results After Training ---")
     print(f"- Win Rate: {winrate:.2f}%")
     print(f"- Lose Rate: {lose_rate:.2f}%")

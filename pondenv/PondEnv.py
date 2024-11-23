@@ -105,7 +105,6 @@ class PondEnv:
         state_vector[-4] = self.board.dark_player.score
         state_vector[-3] = self.board.light_player.remaining_tokens()
         state_vector[-2] = self.board.dark_player.remaining_tokens()
-        state_vector[-1] = 1 if self.board.turn == 'light' else 0
 
         return state_vector
 
